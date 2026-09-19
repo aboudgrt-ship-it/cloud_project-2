@@ -2,7 +2,6 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
@@ -21,6 +20,7 @@ class CloudWatchIntegration:
 		log_group_name: str | None = None,
 		sns_topic_arn: str | None = None,
 	) -> None:
+		# boto3 obtains credentials from an IAM role, profile, or environment.
 		region = region_name or os.getenv("AWS_REGION", "us-east-1")
 		self.namespace = namespace
 		self.log_group_name = log_group_name or os.getenv(
@@ -32,9 +32,11 @@ class CloudWatchIntegration:
 		self.logs = boto3.client("logs", region_name=region)
 		self.sns = boto3.client("sns", region_name=region)
 		self.sts = boto3.client("sts", region_name=region)
-		self._sequence_token: str | None = None
+		# Track if log group/stream are verified to avoid redundant API calls.
+		self._log_setup_done = False
 
 	def record_metric(self, metric_name: str, value: float = 1, unit: str = "Count") -> None:
+		# Publish one application metric in the configured namespace.
 		self.cloudwatch.put_metric_data(
 			Namespace=self.namespace,
 			MetricData=[
@@ -47,8 +49,10 @@ class CloudWatchIntegration:
 			],
 		)
 
-	def write_log(self, message: str, level: str = "INFO") -> None:
-		"""Write one structured application event to CloudWatch Logs."""
+	def _ensure_log_setup(self) -> None:
+		"""Ensure the log group and stream exist, called lazily."""
+		if self._log_setup_done:
+			return
 		try:
 			self.logs.create_log_group(logGroupName=self.log_group_name)
 		except self.logs.exceptions.ResourceAlreadyExistsException:
@@ -60,24 +64,31 @@ class CloudWatchIntegration:
 			)
 		except self.logs.exceptions.ResourceAlreadyExistsException:
 			pass
+		self._log_setup_done = True
 
+	def write_log(self, message: str, level: str = "INFO") -> None:
+		"""Write one structured application event to CloudWatch Logs."""
+		self._ensure_log_setup()
+
+		now = datetime.now(timezone.utc)
 		event = {
-			"timestamp": datetime.now(timezone.utc).isoformat(),
+			"timestamp": now.isoformat(),
 			"level": level,
 			"message": message,
 		}
-		request: dict[str, Any] = {
-			"logGroupName": self.log_group_name,
-			"logStreamName": self.log_stream_name,
-			"logEvents": [{"timestamp": int(datetime.now().timestamp() * 1000), "message": json.dumps(event)}],
-		}
-		if self._sequence_token:
-			request["sequenceToken"] = self._sequence_token
 
-		response = self.logs.put_log_events(**request)
-		self._sequence_token = response.get("nextSequenceToken")
+		# In modern CloudWatch Logs, sequenceToken is no longer required.
+		self.logs.put_log_events(
+			logGroupName=self.log_group_name,
+			logStreamName=self.log_stream_name,
+			logEvents=[{
+				"timestamp": int(now.timestamp() * 1000),
+				"message": json.dumps(event)
+			}],
+		)
 
 	def notify(self, subject: str, message: str) -> None:
+		# Notifications are optional; monitoring must still work without an SNS topic.
 		if not self.sns_topic_arn:
 			logger.warning("SNS_TOPIC_ARN is not configured; notification skipped")
 			return
@@ -85,6 +96,7 @@ class CloudWatchIntegration:
 
 	def caller_identity(self) -> dict[str, str]:
 		"""Return the IAM identity selected by the boto3 credential chain."""
+		# STS confirms which IAM role or user is actually being used.
 		response = self.sts.get_caller_identity()
 		return {
 			"account": response["Account"],

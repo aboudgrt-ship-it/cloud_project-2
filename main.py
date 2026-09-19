@@ -1,56 +1,20 @@
 import os
-import time
 
-from flask import jsonify, request
-from flask_jwt_extended import jwt_required
-
+# 1. Import components from the project modules
 from cloudwatch import CloudWatchIntegration
 from jwt_config import create_app
 
-
-app = create_app()
-monitoring = CloudWatchIntegration(
-    namespace=os.getenv("CLOUDWATCH_NAMESPACE", "JwtApi"),
+# 2. Initialize AWS integrations
+# Configuration is loaded automatically from environment variables.
+cw = CloudWatchIntegration(
+    namespace=os.environ.get("CLOUDWATCH_NAMESPACE", "JwtApi"),
+    log_group_name=os.environ.get("CLOUDWATCH_LOG_GROUP", "/jwt-api/application"),
 )
 
-
-@app.before_request
-def start_request_timer() -> None:
-    request.request_started_at = time.perf_counter()
-
-
-@app.after_request
-def record_request(response):
-    duration_ms = round((time.perf_counter() - request.request_started_at) * 1000, 2)
-    metric_name = "Http5xx" if response.status_code >= 500 else "HttpRequest"
-    monitoring.safely_record(metric_name)
-    monitoring.safely_write_log(
-        f"{request.method} {request.path} {response.status_code} {duration_ms}ms",
-        "ERROR" if response.status_code >= 500 else "INFO",
-    )
-
-    if response.status_code >= 500:
-        monitoring.safely_notify(
-            "JWT API server error",
-            f"{request.method} {request.path} returned HTTP {response.status_code}",
-        )
-    return response
-
-
-@app.route("/api/v1/aws/identity", methods=["GET"])
-@jwt_required()
-def aws_identity():
-    """Show the IAM role or user used by boto3 for this application."""
-    try:
-        return jsonify(monitoring.caller_identity()), 200
-    except Exception as error:
-        monitoring.safely_notify("JWT API IAM check failed", str(error))
-        return jsonify({"message": "Unable to verify AWS identity"}), 503
-
+# 3. Initialize the application with optional AWS monitoring.
+app = create_app(monitoring=cw)
 
 if __name__ == "__main__":
-    app.run(
-        host=os.getenv("FLASK_HOST", "0.0.0.0"),
-        port=int(os.getenv("PORT", "5000")),
-        debug=False,
-    )
+    # Start the application.
+    # Ensure JWT_SECRET_KEY and AWS credentials are configured in the environment.
+    app.run(host="0.0.0.0", port=5000, debug=False)

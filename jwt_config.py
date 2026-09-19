@@ -9,27 +9,35 @@ from flask_jwt_extended import (
     create_refresh_token,
     get_jwt_identity,
     jwt_required,
+    set_access_cookies,
+    set_refresh_cookies,
 )
 
 from configuration import Authenticator, DynamoDBUserRepository
 
 
-def create_app():
+def create_app(monitoring=None):
     app = Flask(__name__)
 
-    # API configuration
+    # Keep token lifetimes and secrets configurable for each deployment.
+
     app.config["JSON_SORT_KEYS"] = False
     jwt_secret = os.environ.get("JWT_SECRET_KEY")
+
+
     if not jwt_secret and os.environ.get("APP_ENV", "development") == "production":
         raise RuntimeError("JWT_SECRET_KEY must be configured in production")
     app.config["JWT_SECRET_KEY"] = jwt_secret or "development-secret-change-me-32-bytes"
-    app.config["JWT_TOKEN_LOCATION"] = ["headers"]
+    app.config["JWT_TOKEN_LOCATION"] = ["headers", "cookies"]
+    app.config["JWT_COOKIE_SECURE"] = os.environ.get("APP_ENV") == "production"
+    app.config["JWT_COOKIE_SAMESITE"] = "Lax"
     app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(
         minutes=int(os.environ.get("JWT_ACCESS_MINUTES", "15"))
     )
     app.config["JWT_REFRESH_TOKEN_EXPIRES"] = timedelta(
         days=int(os.environ.get("JWT_REFRESH_DAYS", "30"))
     )
+
     app.config["JWT_DECODE_LEEWAY"] = 5
 
     jwt = JWTManager(app)
@@ -37,7 +45,7 @@ def create_app():
     table_name = os.environ.get("DYNAMODB_TABLE", "users")
     region_name = os.environ.get("AWS_REGION", "us-east-1")
 
-    # One shared authentication service for all routes.
+    # Construct the repository once so every route reuses the same service.
     repository = DynamoDBUserRepository(table_name, region_name)
     auth_system = Authenticator(repository)
 
@@ -73,11 +81,18 @@ def create_app():
 
         try:
             auth_system.create_user(username, password)
-            return jsonify({"message": "User created successfully", "username": username}), 201
-        except ValueError as error:
-            return jsonify({"message": str(error)}), 400
-        except ClientError as error:
-            return jsonify({"message": "DynamoDB error", "error": str(error)}), 500
+
+            access_token = create_access_token(identity=username)
+            refresh_token = create_refresh_token(identity=username)
+            return jsonify({
+                "message": "User registered successfully",
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "token_type": "Bearer",
+                "expires_in": int(app.config["JWT_ACCESS_TOKEN_EXPIRES"].total_seconds()),
+            }), 200
+        except ClientError:
+            return jsonify({"message": "Failed to connect to DynamoDB"}), 500
 
     @app.route("/api/v1/auth/login", methods=["POST"])
     @app.route("/login", methods=["POST"])
@@ -90,20 +105,53 @@ def create_app():
             return jsonify({"message": "username and password are required"}), 400
 
         try:
-            if auth_system.verify_user(username, password):
+            success, message = auth_system.authenticate(username, password)
+
+            if success:
+
                 access_token = create_access_token(identity=username)
                 refresh_token = create_refresh_token(identity=username)
-                return jsonify({
-                    "message": "Login successful",
+
+
+                response = jsonify({
+                    "message": message,
                     "access_token": access_token,
                     "refresh_token": refresh_token,
                     "token_type": "Bearer",
                     "expires_in": int(app.config["JWT_ACCESS_TOKEN_EXPIRES"].total_seconds()),
-                }), 200
+                })
 
-            return jsonify({"message": "Invalid username or password"}), 401
-        except ClientError as error:
-            return jsonify({"message": "Failed to connect to DynamoDB", "error": str(error)}), 500
+
+                set_access_cookies(response, access_token)
+                set_refresh_cookies(response, refresh_token)
+
+                if monitoring is not None:
+                    monitoring.safely_write_log(
+                        f"Successful login for user: {username}", level="INFO"
+                    )
+                    monitoring.safely_record("SuccessfulLogins")
+                    monitoring.safely_notify(
+                        subject="Security Alert: Successful Login",
+                        message=f"The user '{username}' logged in successfully.",
+                    )
+
+                return response, 200
+
+            if monitoring is not None:
+                monitoring.safely_write_log(
+                    f"Failed login attempt for user: {username}", level="WARNING"
+                )
+                monitoring.safely_record("FailedLogins")
+                monitoring.safely_notify(
+                    subject="Security Alert: Failed Login Attempt",
+                    message=f"A failed login attempt was detected for username: '{username}'.",
+                )
+
+            status_code = 403 if "locked" in message.lower() else 401
+            return jsonify({"message": message}), status_code
+
+        except ClientError:
+            return jsonify({"message": "Failed to connect to DynamoDB"}), 500
 
     @app.route("/api/v1/auth/refresh", methods=["POST"])
     @app.route("/refresh", methods=["POST"])
@@ -111,12 +159,18 @@ def create_app():
     def refresh():
         """Exchange a refresh token for a rotated access/refresh token pair."""
         current_user = get_jwt_identity()
-        return jsonify({
-            "access_token": create_access_token(identity=current_user),
-            "refresh_token": create_refresh_token(identity=current_user),
+        # Refreshing does not query DynamoDB, keeping this frequent path fast.
+        access_token = create_access_token(identity=current_user)
+        refresh_token = create_refresh_token(identity=current_user)
+        response = jsonify({
+            "access_token": access_token,
+            "refresh_token": refresh_token,
             "token_type": "Bearer",
             "expires_in": int(app.config["JWT_ACCESS_TOKEN_EXPIRES"].total_seconds()),
-        }), 200
+        })
+        set_access_cookies(response, access_token)
+        set_refresh_cookies(response, refresh_token)
+        return response, 200
 
     @app.route("/api/v1/auth/me", methods=["GET"])
     @app.route("/me", methods=["GET"])
@@ -127,13 +181,19 @@ def create_app():
             "logged_in_as": current_user,
             "status": "Access confirmed",
             "database": "DynamoDB",
+            "protected": True
+
+        }), 200
+
+    @app.route("/protected_token", methods=["GET"])
+    @jwt_required()
+    def protected():
+        current_user = get_jwt_identity()
+        return jsonify({
+            "logged_in_as": current_user,
+            "status": "Access confirmed",
+            "database": "DynamoDB",
+            "protected": True,
         }), 200
 
     return app
-
-
-app = create_app()
-
-
-if __name__ == "__main__":
-    app.run(debug=False, host="0.0.0.0", port=5000)

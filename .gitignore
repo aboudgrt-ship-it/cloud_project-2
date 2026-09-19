@@ -1,2 +1,22 @@
 /.venv
+/venv
+/.venv-1
 /__pycache__
+*.py[cod]
+
+# Local environment and cloud credentials
+.env
+.env.*
+!.env.example
+.aws/
+**/.aws/
+credentials
+credentials.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Infrastructure state can contain cloud credentials
+*.tfstate
+*.tfstate.*

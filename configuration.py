@@ -1,112 +1,158 @@
 import os
-from typing import Optional
+import time
+from typing import Optional, Tuple
+from datetime import datetime , timezone
 
 import bcrypt
 import boto3
 from botocore.exceptions import ClientError
 
+MAX_ATTEMPTS = 5
+LOCKOUT_DURATION_SECONDS = 900  # 15 minutes
 
 class DynamoDBUserRepository:
-    """Store and retrieve user password hashes in DynamoDB."""
+    """Store and retrieve user authentication data in DynamoDB."""
 
     def __init__(self, table_name: str, region_name: str) -> None:
-        # We create a DynamoDB table resource once so the app can reuse it.
         dynamodb = boto3.resource("dynamodb", region_name=region_name)
         self.table = dynamodb.Table(table_name)
 
-    def save_password_hash(self, username: str, password_hash: bytes) -> None:
-        # DynamoDB stores values as strings, numbers, or JSON-like objects.
-        # Because raw bytes are not supported, we convert the hash to text before saving.
+    def save_user(self, username: str, password_hash: bytes) -> None:
+        """Create a new user with initial security fields."""
         self.table.put_item(
             Item={
                 "username": username,
                 "password_hash": password_hash.decode("utf-8"),
-            }
+                "failed_attempts": 0,
+                "lockout_until": 0,
+            },
+            ConditionExpression="attribute_not_exists(username)",
         )
 
-    def get_password_hash(self, username: str) -> Optional[bytes]:
-        # If the user does not exist, DynamoDB returns no item.
+    def get_user_data(self, username: str) -> Optional[dict]:
+        """Fetch all user data from DynamoDB."""
         response = self.table.get_item(Key={"username": username})
-        item = response.get("Item")
+        return response.get("Item")
 
-        if item is None:
-            return None
+    def increment_failed_attempts(self, username: str) -> int:
+        """Increment failed attempts and set lockout if threshold reached."""
+        response = self.table.update_item(
+            Key={"username": username},
+            UpdateExpression="SET failed_attempts = failed_attempts + :inc",
+            ExpressionAttributeValues={":inc": 1},
+            ReturnValues="UPDATED_NEW"
+        )
+        attempts = int(response["Attributes"]["failed_attempts"])
 
-        stored_hash = item.get("password_hash")
-        if stored_hash is None:
-            return None
+        if attempts >= MAX_ATTEMPTS:
+            lockout_time = int(time.time()) + LOCKOUT_DURATION_SECONDS
+            self.table.update_item(
+                Key={"username": username},
+                UpdateExpression="SET lockout_until = :lt",
+                ExpressionAttributeValues={":lt": lockout_time}
+            )
+        return attempts
 
-        return stored_hash.encode("utf-8")
+    def reset_failed_attempts(self, username: str) -> None:
+        """Reset failed attempts and lockout upon successful login."""
+        self.table.update_item(
+            Key={"username": username},
+            UpdateExpression="SET failed_attempts = :zero, lockout_until = :zero",
+            ExpressionAttributeValues={":zero": 0},
+        )
 
 
 class Authenticator:
-    """Handle user registration and password verification."""
+    """Handle user registration and secure password verification."""
 
     def __init__(self, user_repository: DynamoDBUserRepository) -> None:
         self.user_repository = user_repository
 
     def create_user(self, username: str, password: str) -> None:
-        # It is better to validate input before saving to avoid blank usernames.
+        """Validate input and hash password before saving."""
         username = username.strip()
-        if not username:
-            raise ValueError("Username cannot be empty.")
-        if not password:
-            raise ValueError("Password cannot be empty.")
+        if not username or not password:
+            raise ValueError("Username and password cannot be empty.")
 
         password_hash = self.hash_password(password)
-        self.user_repository.save_password_hash(username, password_hash)
+        self.user_repository.save_user(username, password_hash)
 
     @staticmethod
     def hash_password(password: str) -> bytes:
-        # bcrypt automatically adds a random salt, so two identical passwords get different hashes.
+        """Generate a secure bcrypt  hash."""
         return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
 
-    def get_stored_password_hash(self, username: str) -> Optional[bytes]:
-        return self.user_repository.get_password_hash(username)
+    def authenticate(self, username: str, password: str) -> Tuple[bool, str]:
+        """
+        Authenticate a user with brute-force protection.
+        Returns: (Success Boolean, Message String)
+        """
+        user_data = self.user_repository.get_user_data(username)
 
-    def verify_user(self, username: str, password: str) -> bool:
-        stored_password_hash = self.get_stored_password_hash(username)
+        if not user_data:
+            return False, "Invalid username or password."
 
-        if stored_password_hash is None:
-            return False
+        # 1. Check if the account is currently locked
+        current_time = int(time.time())
+        lockout_until = int(user_data.get("lockout_until", 0))
 
-        return bcrypt.checkpw(password.encode("utf-8"), stored_password_hash)
+        if lockout_until > current_time:
+            wait_time = (lockout_until - current_time) // 60
+            return False, f"Account locked. Try again in {max(1, wait_time)} minutes."
+
+        # 2. Verify Password
+        stored_hash = user_data.get("password_hash", "").encode("utf-8")
+        try:
+            password_matches = bcrypt.checkpw(password.encode("utf-8"), stored_hash)
+        except (ValueError, TypeError):
+            password_matches = False
+
+        if password_matches:
+            # Success: Reset attempts
+            self.user_repository.reset_failed_attempts(username)
+            return True, "Login successful."
+        else:
+            # Failure: Increment attempts and potentially lock
+            attempts = self.user_repository.increment_failed_attempts(username)
+            if attempts >= MAX_ATTEMPTS:
+                return False, f"Too many failed attempts. Account locked for {LOCKOUT_DURATION_SECONDS // 60} minutes."
+            return False, "Invalid username or password."
+
+    def get_user_profile(self, username: str) -> Optional[dict]:
+        """Retrieve non-sensitive user data."""
+        user_data = self.user_repository.get_user_data(username)
+        if not user_data:
+            return None
+        # Return only safe fields
+        return {"username": user_data.get("username")}
 
 
 def main() -> None:
-    # The table name and region should come from environment variables for flexibility and security.
     table_name = os.getenv("DYNAMODB_TABLE", "users")
     region_name = os.getenv("AWS_REGION", "us-east-1")
 
     repository = DynamoDBUserRepository(table_name, region_name)
     authenticator = Authenticator(repository)
 
-    username = input("Create a username: ").strip()
-    if not username:
-        print("Username cannot be empty.")
-        return
+    action = input("Choose action (register/login): ").strip().lower()
+    username = input("Username: ").strip()
 
-    try:
-        authenticator.create_user(username, input("Create a password: "))
-    except ClientError as error:
-        print(f"Could not save user: {error.response['Error']['Code']}")
-        return
-    except ValueError as error:
-        print(error)
-        return
-
-    for _ in range(3):
-        password = input("Enter your password: ")
+    if action == "register":
+        password = input("Password: ")
         try:
-            if authenticator.verify_user(username, password):
-                print("Login successful.")
-                return
+            authenticator.create_user(username, password)
+            print("User registered successfully.")
+        except Exception as e:
+            print(f"Error: {e}")
+
+    elif action == "login":
+        password = input("Password: ")
+        try:
+            success, message = authenticator.authenticate(username, password)
+            print(message)
         except ClientError as error:
-            print(f"Could not read user: {error.response['Error']['Code']}")
-            return
-
-        print("Incorrect password.")
-
-    print("Too many failed attempts. Please try again later.")
+            print(f"Database error: {error.response['Error']['Code']}")
+    else:
+        print("Invalid action.")
 
 
