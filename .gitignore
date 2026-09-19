@@ -20,3 +20,9 @@ credentials.*
 # Infrastructure state can contain cloud credentials
 *.tfstate
 *.tfstate.*
+
+# Local databases and runtime data
+*.db
+*.sqlite
+*.sqlite3
+/instance/
